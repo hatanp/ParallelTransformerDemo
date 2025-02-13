@@ -106,14 +106,6 @@ class TPReduce(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         pass
-
-class ColumnParallelLinear(nn.Module):
-    def __init__(self, dim1, dim2):
-        super().__init__()
-        self.net = nn.Linear(dim1, dim2//TP)
-
-    def forward(self, x):
-        return self.net(x)
         
 class ColumnParallelLinear(nn.Module):
     def __init__(self, dim1, dim2):
