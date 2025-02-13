@@ -131,7 +131,7 @@ class RowParallelLinear(nn.Module):
     def forward(self, x):
         intermediate = self.net(x)
         #with torch.no_grad():
-        #TPReduce.apply(intermediate)
+        TPReduce.apply(intermediate)
         """torch.distributed.all_reduce(
             intermediate, group=tp_group
         )"""
@@ -217,13 +217,13 @@ def num_floating_point_operations(batch_size, dim, depth, heads, dim_head, mlp_d
 
 
 if __name__ == '__main__':
-    seq = 10000
-    dim = 9216
+    seq = 8192
+    dim = 6144
     mlp_dim = dim*4
-    heads = 72
+    heads = 48
     dim_head = dim//heads
     assert dim_head==128
-    depth = 15
+    depth = 32
 
     assert dim % TP == 0
 
@@ -245,7 +245,7 @@ if __name__ == '__main__':
         params = sum(p.numel()/1e9 for p in model.parameters() if p.requires_grad)
         print('=> Trainable Params: {:.2f}B per rank, {:.2f}B total'.format(params, params*TP))
     y = None
-    iters = 30
+    iters = 80
     flops = num_floating_point_operations(1, dim, depth, heads, dim_head, mlp_dim, seq)
     for i in range(iters):
         start = time.time()
@@ -254,6 +254,7 @@ if __name__ == '__main__':
         loss = loss_fn(y,target)
         model.backward(loss)
         #loss = torch.tensor(0.0)
+        #if i % 2 == 0:
         model.step()
         end = time.time()
         if rank == 0:
