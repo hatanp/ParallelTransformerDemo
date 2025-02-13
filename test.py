@@ -29,6 +29,7 @@ world_size = int(MPI.COMM_WORLD.Get_size())
 
 local_rank = rank % 12
 torch.xpu.set_device(local_rank)
+device = f"xpu:{torch.xpu.current_device()}"
 
 if rank == 0:
    master_addr              = socket.gethostname()
@@ -70,6 +71,25 @@ for i in range(TP):
         dp_group=group
         #print(f"DP group = {ranks} on {rank}")
 
+class TPReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, intermediate):
+        torch.distributed.all_reduce(
+            intermediate, group=tp_group
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pass
+
+class ColumnParallelLinear(nn.Module):
+    def __init__(self, dim1, dim2):
+        super().__init__()
+        self.net = nn.Linear(dim1, dim2//TP)
+
+    def forward(self, x):
+        return self.net(x)
+        
 class ColumnParallelLinear(nn.Module):
     def __init__(self, dim1, dim2):
         super().__init__()
@@ -85,9 +105,11 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x):
         intermediate = self.net(x)
-        torch.distributed.all_reduce(
+        with torch.no_grad():
+            TPReduce.apply(intermediate)
+        """torch.distributed.all_reduce(
             intermediate, group=tp_group
-        )
+        )"""
         return intermediate
 
 class ParallelMLP(nn.Module):
@@ -101,7 +123,7 @@ class ParallelMLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x) + x
 
 
 class Attention(nn.Module):
@@ -124,24 +146,50 @@ class Attention(nn.Module):
 
         out = rearrange(attn_out, 'b h s d -> b s (h d)')
         out = self.to_out(out)
-        return self.norm(out)
+        return self.norm(out) + x
 
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for _ in range(depth):
+            self.layers.append(nn.Sequential(Attention(dim, heads=heads, dim_head=dim_head),ParallelMLP(dim, mlp_dim)))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 if __name__ == '__main__':
-    seq = 2048
-    dim = 128*12
-    mlp_dim = dim*2
-    heads = 12
+    seq = 10000
+    dim = 4608
+    mlp_dim = dim*4
+    heads = 36
     dim_head = dim//heads
+    assert dim_head==128
+    depth = 40
 
     assert dim % TP == 0
 
-    x = torch.randn(1, seq, dim) #B, hc, s, hs
-    layer = nn.Sequential(Attention(dim, heads=heads, dim_head=dim_head),ParallelMLP(dim, mlp_dim))
+    x = torch.randn(1, seq, dim).to(device) #B, s, hc*hs
+    target = torch.randn(1, seq, dim).to(device) #B, s, hc*hs
+    loss_fn = torch.nn.MSELoss()
+    model = Transformer(dim, depth, heads, dim_head, mlp_dim).to(device)
 
+    optimizer = torch.optim.AdamW(model.parameters())
     #print(layer)
     if rank == 0:
-        print(f'=> Trainable Params: {sum(p.numel() for p in layer.parameters() if p.requires_grad)}')
-    y = layer(x)
+        params = sum(p.numel()/1e9 for p in model.parameters() if p.requires_grad)
+        print('=> Trainable Params: {:.2f}B per rank, {:.2f}B total'.format(params, params*TP))
+    y = None
+    iters = 30
+    for i in range(iters):
+        optimizer.zero_grad()
+        y = model(x)
+        loss = loss_fn(y,target)
+        loss.backward()
+        if rank == 0:
+            print(f"{i}/{iters} loss:", loss.item(), flush=True)
+        optimizer.step()
     if rank == 0:
         print(y.shape)
