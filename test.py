@@ -7,6 +7,7 @@ import intel_extension_for_pytorch as ipex
 import oneccl_bindings_for_pytorch
 from einops import rearrange
 from einops.layers.torch import Rearrange
+import deepspeed
 
 import time
 import socket
@@ -28,6 +29,7 @@ world_size = int(MPI.COMM_WORLD.Get_size())
 #logging.info(f"rank {rank}/{world_size}")
 
 local_rank = rank % 12
+os.environ["LOCAL_RANK"] = str(local_rank)
 torch.xpu.set_device(local_rank)
 device = f"xpu:{torch.xpu.current_device()}"
 
@@ -54,7 +56,7 @@ torch.distributed.init_process_group(
     world_size=world_size,
     rank=rank,
 )
-TP = 12
+TP=12
 tp_group=None
 for i in range(world_size//TP):
     ranks = [j for j in range(i*TP,(i+1)*TP)]
@@ -70,6 +72,29 @@ for i in range(TP):
     if rank in ranks:
         dp_group=group
         #print(f"DP group = {ranks} on {rank}")
+
+class WPMPU():
+    """
+    A model parallelism unit object that implements
+            get_{model,data}_parallel_{rank,group,world_size}()
+    """
+    def get_model_parallel_rank(self):
+        return torch.distributed.get_rank(group=self.get_model_parallel_group())
+    def get_model_parallel_group(self):
+        global tp_group
+        return tp_group
+    def get_model_parallel_world_size(self):
+        global TP
+        return TP
+    def get_data_parallel_rank(self):
+        return torch.distributed.get_rank(group=self.get_data_parallel_group())
+    def get_data_parallel_group(self):
+        global dp_group
+        return dp_group
+    def get_data_parallel_world_size(self):
+        global world_size
+        global TP
+        return world_size//TP
 
 class TPReduce(torch.autograd.Function):
     @staticmethod
@@ -105,8 +130,8 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x):
         intermediate = self.net(x)
-        with torch.no_grad():
-            TPReduce.apply(intermediate)
+        #with torch.no_grad():
+        #TPReduce.apply(intermediate)
         """torch.distributed.all_reduce(
             intermediate, group=tp_group
         )"""
@@ -143,6 +168,7 @@ class Attention(nn.Module):
         
 
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        #attn_out = q
 
         out = rearrange(attn_out, 'b h s d -> b s (h d)')
         out = self.to_out(out)
@@ -160,14 +186,44 @@ class Transformer(nn.Module):
             x = layer(x)
         return x
 
+def num_floating_point_operations(batch_size, dim, depth, heads, dim_head, mlp_dim, seq):
+    # Group Query Attention.
+    # if not args.group_query_attention:
+        # args.num_query_groups = args.num_attention_heads
+    # MoE.
+    # num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
+    num_experts_routed_to = 1
+    swiglu = False
+    gated_linear_multiplier = 3 / 2 if swiglu else 1
+    return (
+        12
+        * batch_size
+        * seq
+        * depth
+        * dim
+        * dim
+        * (
+            1
+            + (
+                (mlp_dim / dim)
+                * num_experts_routed_to
+                * gated_linear_multiplier
+            )
+            + (1)
+            + (seq / dim)
+            + (1 / (2 * depth * dim))
+        )
+    )
+
+
 if __name__ == '__main__':
     seq = 10000
-    dim = 4608
+    dim = 9216
     mlp_dim = dim*4
-    heads = 36
+    heads = 72
     dim_head = dim//heads
     assert dim_head==128
-    depth = 40
+    depth = 15
 
     assert dim % TP == 0
 
@@ -175,21 +231,32 @@ if __name__ == '__main__':
     target = torch.randn(1, seq, dim).to(device) #B, s, hc*hs
     loss_fn = torch.nn.MSELoss()
     model = Transformer(dim, depth, heads, dim_head, mlp_dim).to(device)
-
+    parameters = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = torch.optim.AdamW(model.parameters())
+    mpu = WPMPU()
+    model, optimizer, _, _ = deepspeed.initialize(args=None,
+                                                     model=model,
+                                                     mpu=mpu,
+                                                     optimizer=optimizer,
+                                                     model_parameters=parameters,
+                                                     config="deepspeed_config.json")
     #print(layer)
     if rank == 0:
         params = sum(p.numel()/1e9 for p in model.parameters() if p.requires_grad)
         print('=> Trainable Params: {:.2f}B per rank, {:.2f}B total'.format(params, params*TP))
     y = None
     iters = 30
+    flops = num_floating_point_operations(1, dim, depth, heads, dim_head, mlp_dim, seq)
     for i in range(iters):
-        optimizer.zero_grad()
+        start = time.time()
+        #optimizer.zero_grad()
         y = model(x)
         loss = loss_fn(y,target)
-        loss.backward()
+        model.backward(loss)
+        #loss = torch.tensor(0.0)
+        model.step()
+        end = time.time()
         if rank == 0:
-            print(f"{i}/{iters} loss:", loss.item(), flush=True)
-        optimizer.step()
+            print(f"{i}/{iters} loss: {loss.item()}, in {end-start}s, TFLOPS/s {flops/(TP*1e12*(end-start))}", flush=True)
     if rank == 0:
         print(y.shape)
